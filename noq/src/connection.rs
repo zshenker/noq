@@ -1568,7 +1568,7 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// Transmits whose socket would block, each with its datagram bytes
     ///
-    /// While a destination is in here, `poll_transmit_filtered` skips it, so paths on other
+    /// While a network path is in here, `poll_transmit_routed` skips it, so paths on other
     /// sockets keep sending. Retried in order on the next drive.
     blocked_transmits: Vec<(proto::Transmit, Vec<u8>)>,
     /// Our last external address reported by the peer. When multipath is enabled, this will be the
@@ -1624,11 +1624,6 @@ impl State {
         let now = self.runtime.now();
         let mut transmits = 0;
 
-        let max_datagrams = self
-            .sender
-            .max_transmit_segments()
-            .min(MAX_TRANSMIT_SEGMENTS);
-
         // Retry blocked transmits first, so each destination keeps its order.
         let mut i = 0;
         while let Some((t, data)) = self.blocked_transmits.get(i) {
@@ -1648,12 +1643,20 @@ impl State {
         loop {
             self.send_buffer.clear();
             let blocked = &self.blocked_transmits;
-            let Some(t) = self.inner.poll_transmit_filtered(
-                now,
-                max_datagrams,
-                &mut self.send_buffer,
-                &mut |destination| !blocked.iter().any(|(t, _)| t.destination == destination),
-            ) else {
+            let sender = &self.sender;
+            let Some(t) =
+                self.inner
+                    .poll_transmit_routed(now, &mut self.send_buffer, &mut |path| {
+                        let is_blocked = blocked.iter().any(|(t, _)| {
+                            t.destination == path.remote() && t.src_ip == path.local_ip()
+                        });
+                        (!is_blocked).then(|| {
+                            sender
+                                .max_transmit_segments_to(path.remote())
+                                .min(MAX_TRANSMIT_SEGMENTS)
+                        })
+                    })
+            else {
                 break;
             };
             transmits += match t.segment_size {
@@ -2053,7 +2056,7 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 
 /// Maximum number of transmits held back because their socket would block.
 ///
-/// Each blocked destination is skipped by `poll_transmit_filtered`, so this bounds the work
+/// Each blocked network path is skipped by `poll_transmit_routed`, so this bounds the work
 /// and memory a connection spends on sockets that are not ready. Beyond it, the oldest
 /// blocked transmit is dropped and left to loss recovery.
 const MAX_BLOCKED_TRANSMITS: usize = 8;

@@ -125,6 +125,16 @@ pub trait UdpSender: Send + Sync + Debug + 'static {
     fn max_transmit_segments(&self) -> NonZeroUsize {
         NonZeroUsize::MIN
     }
+
+    /// Maximum number of datagrams that a [`Transmit`] to `destination` may encode.
+    ///
+    /// A sender that spans several sockets answers for the socket that `destination` routes
+    /// to, so paths on a GSO socket are not held to the limit of a socket without GSO. The
+    /// default is [`max_transmit_segments`](UdpSender::max_transmit_segments).
+    fn max_transmit_segments_to(&self, destination: SocketAddr) -> NonZeroUsize {
+        let _ = destination;
+        self.max_transmit_segments()
+    }
 }
 
 pin_project_lite::pin_project! {
