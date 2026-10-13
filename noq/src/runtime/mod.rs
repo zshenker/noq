@@ -71,6 +71,8 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// An endpoint with several sockets sends each datagram on the socket with the longest
     /// matching range. An IPv4 range also matches the IPv4-mapped IPv6 form of its addresses,
     /// because an endpoint that owns an IPv6 socket represents every remote address as IPv6.
+    /// An IPv6 range only matches IPv4-mapped addresses if it lies within `::ffff:0:0/96`, so a
+    /// dual-stack socket that should carry IPv4 declares that range in addition to `::/0`.
     ///
     /// The default covers the whole address family of [`local_addr`], which is what a
     /// single-socket endpoint always did.

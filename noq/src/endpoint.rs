@@ -1251,10 +1251,17 @@ impl Future for SocketDriver {
 }
 
 /// Returns whether `ip` is in `range`, treating IPv4-mapped addresses as IPv4
+///
+/// An IPv4-mapped address is matched against IPv4 ranges, and against IPv6 ranges only if
+/// they lie within `::ffff:0:0/96`. A plain `::/0` socket is therefore never asked to send
+/// IPv4, which only a dual-stack socket can do, and such a socket declares it.
 fn route_contains(range: &IpNet, ip: IpAddr) -> bool {
     match (range, ip) {
         (IpNet::V4(range), IpAddr::V6(ip)) => {
             ip.to_ipv4_mapped().is_some_and(|ip| range.contains(&ip))
+        }
+        (IpNet::V6(range), IpAddr::V6(ip)) if ip.to_ipv4_mapped().is_some() => {
+            range.prefix_len() >= 96 && range.contains(&ip)
         }
         (range, ip) => range.contains(&ip),
     }
@@ -1421,6 +1428,16 @@ mod tests {
         assert!(route_contains(&v6, "fd15:70a:510b:1::1".parse().unwrap()));
         assert!(!route_contains(&v6, "fd15:70a:510b:2::1".parse().unwrap()));
         assert!(!route_contains(&v6, "10.1.2.3".parse().unwrap()));
+        // Only a dual-stack range covers IPv4-mapped addresses.
+        let all_v6: IpNet = "::/0".parse().unwrap();
+        let dual_stack: IpNet = "::ffff:0:0/96".parse().unwrap();
+        assert!(!route_contains(&all_v6, "::ffff:10.1.2.3".parse().unwrap()));
+        assert!(route_contains(
+            &dual_stack,
+            "::ffff:10.1.2.3".parse().unwrap()
+        ));
+        assert!(route_contains(&all_v6, "2001:db8::1".parse().unwrap()));
+        assert!(!route_contains(&dual_stack, "2001:db8::1".parse().unwrap()));
     }
 
     fn route(range: &str, socket: usize, local: &str) -> Route {
