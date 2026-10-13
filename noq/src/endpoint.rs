@@ -10,7 +10,7 @@ use std::{
     str,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
@@ -1028,21 +1028,24 @@ impl RecvState {
 #[derive(Debug)]
 pub(crate) struct EndpointSocket {
     /// Locked by the driver for `poll_recv` and by the state to create senders
+    ///
+    /// The trait takes `&mut self` for `poll_recv` and `&self` for `create_sender`, and the
+    /// two are called from different tasks, so shared access needs a lock. It replaces the
+    /// endpoint lock that the single driver used to hold around `poll_recv`, including the
+    /// syscall. In steady state only the driver takes it, once per batch, so it is
+    /// uncontended. `create_sender` is called on connect, accept, rebind and socket removal.
     socket: Mutex<Box<dyn AsyncUdpSocket>>,
     /// Destination ranges this socket sends to, see [`AsyncUdpSocket::ip_ranges`]
     ranges: Vec<IpNet>,
     /// Whether the socket's local address is IPv6
     ipv6: bool,
     max_receive_segments: NonZeroUsize,
-    /// Stop signal for the socket's [`SocketDriver`]
-    recv: Mutex<RecvTask>,
-}
-
-/// The waker and stop flag of a [`SocketDriver`]
-#[derive(Debug, Default)]
-struct RecvTask {
-    waker: Option<Waker>,
-    stopped: bool,
+    /// Set to tell the socket's [`SocketDriver`] to exit
+    stopped: AtomicBool,
+    /// The waker of the parked [`SocketDriver`], to wake it when stopped
+    ///
+    /// Only touched when the driver parks or is stopped, never in the receive loop.
+    recv_waker: Mutex<Option<Waker>>,
 }
 
 impl EndpointSocket {
@@ -1061,7 +1064,8 @@ impl EndpointSocket {
                     ranges: socket.ip_ranges(),
                     max_receive_segments: socket.max_receive_segments(),
                     socket: Mutex::new(socket),
-                    recv: Mutex::new(RecvTask::default()),
+                    stopped: AtomicBool::new(false),
+                    recv_waker: Mutex::new(None),
                 }))
             })
             .collect()
@@ -1069,9 +1073,10 @@ impl EndpointSocket {
 
     /// Tells the socket's [`SocketDriver`] to exit
     fn stop(&self) {
-        let mut recv = self.recv.lock().unwrap();
-        recv.stopped = true;
-        if let Some(waker) = recv.waker.take() {
+        // Set the flag before taking the waker. A driver that parks concurrently stores its
+        // waker first and checks the flag after, so one of the two sides sees the other.
+        self.stopped.store(true, Ordering::Release);
+        if let Some(waker) = self.recv_waker.lock().unwrap().take() {
             waker.wake();
         }
     }
@@ -1162,7 +1167,7 @@ impl Future for SocketDriver {
             std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
         };
         let result = loop {
-            if this.socket.recv.lock().unwrap().stopped {
+            if this.socket.stopped.load(Ordering::Acquire) {
                 break Poll::Ready(());
             }
             let poll = this
@@ -1189,11 +1194,10 @@ impl Future for SocketDriver {
                     }
                 }
                 Poll::Pending => {
-                    let mut recv = this.socket.recv.lock().unwrap();
-                    if recv.stopped {
+                    *this.socket.recv_waker.lock().unwrap() = Some(cx.waker().clone());
+                    if this.socket.stopped.load(Ordering::Acquire) {
                         break Poll::Ready(());
                     }
-                    recv.waker = Some(cx.waker().clone());
                     break Poll::Pending;
                 }
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
@@ -1302,6 +1306,17 @@ impl UdpSender for RoutingSender {
 
     fn max_transmit_segments(&self) -> NonZeroUsize {
         self.max_transmit_segments
+    }
+
+    fn max_transmit_segments_to(&self, destination: SocketAddr) -> NonZeroUsize {
+        match self
+            .routes
+            .iter()
+            .find(|(range, _)| route_contains(range, destination.ip()))
+        {
+            Some(&(_, index)) => self.senders[index].max_transmit_segments_to(destination),
+            None => self.max_transmit_segments,
+        }
     }
 }
 
