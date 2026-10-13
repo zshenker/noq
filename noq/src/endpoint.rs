@@ -378,6 +378,17 @@ impl Endpoint {
             .set_server_config(server_config.map(Arc::new))
     }
 
+    /// Create a sender over the endpoint's current sockets
+    ///
+    /// Transmits are routed to a socket like a connection's are, by destination and source
+    /// address. This allows sending datagrams outside of a connection from the same sockets.
+    ///
+    /// The sender reflects the sockets at the time of the call. After a rebind, or once a
+    /// socket failed and was removed, create a new one.
+    pub fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        self.inner.state.lock().unwrap().create_sender()
+    }
+
     /// Get the local `SocketAddr` the underlying socket is bound to
     ///
     /// With several sockets, this is the address of the first one.
