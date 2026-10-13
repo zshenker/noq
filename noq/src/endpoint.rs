@@ -325,9 +325,9 @@ impl Endpoint {
         for socket in inner.retired.drain(..) {
             socket.stop();
         }
-        inner.retired = mem::replace(&mut inner.sockets, sockets);
-        inner.ipv6 = inner.sockets.iter().any(|s| s.ipv6);
-        inner.sender = inner.create_sender();
+        let retired = mem::take(&mut inner.sockets);
+        inner.retired = retired;
+        inner.set_sockets(sockets);
         for socket in &inner.sockets {
             SocketDriver::spawn(&self.inner.0, &inner, socket.clone());
         }
@@ -621,6 +621,8 @@ impl EndpointInner {
 pub(crate) struct State {
     /// The current sockets, each received from by its own [`SocketDriver`]
     sockets: Vec<Arc<EndpointSocket>>,
+    /// Route table over `sockets`, shared by every [`RoutingSender`] until the sockets change
+    routes: Arc<[Route]>,
     /// Sender for endpoint-generated responses, routing to all current sockets
     sender: Pin<Box<dyn UdpSender>>,
     /// During an active migration, the retired sockets receive traffic
@@ -658,13 +660,21 @@ pub(crate) struct Shared {
 }
 
 impl State {
+    /// Replaces the current sockets and everything derived from them
+    fn set_sockets(&mut self, sockets: Vec<Arc<EndpointSocket>>) {
+        self.sockets = sockets;
+        self.ipv6 = self.sockets.iter().any(|s| s.ipv6);
+        self.routes = Route::table(&self.sockets);
+        self.sender = self.create_sender();
+    }
+
     /// Creates a sender that routes transmits to the current sockets
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
         if let [socket] = &self.sockets[..] {
             // Keep the single-socket path free of routing.
             return socket.socket.lock().unwrap().create_sender();
         }
-        Box::pin(RoutingSender::new(&self.sockets))
+        Box::pin(RoutingSender::new(self.routes.clone(), &self.sockets))
     }
 
     /// Returns whether `socket` is one of the current sockets, as opposed to a retired one
@@ -945,9 +955,10 @@ impl EndpointRef {
         let (sender, events) = mpsc::unbounded_channel();
         let recv_state = RecvState::new(sender);
         let mut state = State {
-            sockets,
-            // Replaced below, once `State::create_sender` can see the sockets.
-            sender: Box::pin(RoutingSender::new(&[])),
+            sockets: Vec::new(),
+            routes: Arc::from([]),
+            // Replaced by `set_sockets` below.
+            sender: Box::pin(RoutingSender::new(Arc::from([]), &[])),
             retired: Vec::new(),
             io_error: None,
             inner,
@@ -960,8 +971,7 @@ impl EndpointRef {
             stats: EndpointStats::default(),
             default_client_config: None,
         };
-        state.ipv6 = state.sockets.iter().any(|s| s.ipv6);
-        state.sender = state.create_sender();
+        state.set_sockets(sockets);
         Self(Arc::new(EndpointInner {
             shared: Shared {
                 incoming: Notify::new(),
@@ -1037,6 +1047,8 @@ pub(crate) struct EndpointSocket {
     socket: Mutex<Box<dyn AsyncUdpSocket>>,
     /// Destination ranges this socket sends to, see [`AsyncUdpSocket::ip_ranges`]
     ranges: Vec<IpNet>,
+    /// The socket's local address, see [`Route::local`]
+    local_addr: SocketAddr,
     /// Whether the socket's local address is IPv6
     ipv6: bool,
     max_receive_segments: NonZeroUsize,
@@ -1059,8 +1071,10 @@ impl EndpointSocket {
         sockets
             .into_iter()
             .map(|socket| {
+                let local_addr = socket.local_addr()?;
                 Ok(Arc::new(Self {
-                    ipv6: socket.local_addr()?.is_ipv6(),
+                    local_addr,
+                    ipv6: local_addr.is_ipv6(),
                     ranges: socket.ip_ranges(),
                     max_receive_segments: socket.max_receive_segments(),
                     socket: Mutex::new(socket),
@@ -1138,8 +1152,12 @@ impl SocketDriver {
             return;
         }
         tracing::warn!(error = %e, "socket failed to receive, removing it from the endpoint");
-        state.sockets.retain(|s| !Arc::ptr_eq(s, &self.socket));
-        state.sender = state.create_sender();
+        let mut sockets = mem::take(&mut state.sockets);
+        sockets.retain(|s| !Arc::ptr_eq(s, &self.socket));
+        // Keep `ipv6` as it is: addresses already in use stay in their representation.
+        let ipv6 = state.ipv6;
+        state.set_sockets(sockets);
+        state.ipv6 = ipv6;
         for sender in state.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
             let _ = sender.send(ConnectionEvent::ReplaceSender(state.create_sender()));
@@ -1231,23 +1249,88 @@ fn route_contains(range: &IpNet, ip: IpAddr) -> bool {
     }
 }
 
+/// One entry of an endpoint's route table, see [`Route::table`]
+#[derive(Debug, Clone, Copy)]
+struct Route {
+    /// Destinations this route covers
+    range: IpNet,
+    /// Index of the socket in the endpoint's socket list and in [`RoutingSender::senders`]
+    socket: usize,
+    /// The socket's local address, to honor a transmit's source address
+    ///
+    /// The IP is unspecified for a wildcard-bound socket, which can send from any local
+    /// address. The scope id of an IPv6 address tells link-local sockets apart.
+    local: SocketAddr,
+}
+
+impl Route {
+    /// Builds the route table for `sockets`: longest prefix first, socket order for ties
+    fn table(sockets: &[Arc<EndpointSocket>]) -> Arc<[Self]> {
+        let mut routes: Vec<_> = sockets
+            .iter()
+            .enumerate()
+            .flat_map(|(socket, s)| {
+                s.ranges.iter().map(move |range| Self {
+                    range: *range,
+                    socket,
+                    local: s.local_addr,
+                })
+            })
+            .collect();
+        // Stable sort keeps the socket order for equal prefix lengths.
+        routes.sort_by_key(|route| std::cmp::Reverse(route.range.prefix_len()));
+        routes.into()
+    }
+
+    /// Picks the route for a transmit
+    ///
+    /// Only routes whose range contains the destination are considered, longest prefix
+    /// first. With a source address, the first socket that can send from it wins: one bound
+    /// to the wildcard address, or to exactly that address. If none can, the shortest prefix
+    /// wins as the catch-all. Without a source address the longest prefix wins, except that
+    /// a link-local IPv6 destination prefers the socket with the same scope id.
+    fn select(routes: &[Self], destination: SocketAddr, src_ip: Option<IpAddr>) -> Option<&Self> {
+        let mut matching = routes
+            .iter()
+            .filter(|route| route_contains(&route.range, destination.ip()))
+            .peekable();
+        let first = *matching.peek()?;
+        if let Some(src_ip) = src_ip {
+            let src_ip = src_ip.to_canonical();
+            let mut last = first;
+            for route in matching {
+                let local_ip = route.local.ip().to_canonical();
+                if local_ip.is_unspecified() || local_ip == src_ip {
+                    return Some(route);
+                }
+                last = route;
+            }
+            return Some(last);
+        }
+        if let SocketAddr::V6(destination) = destination
+            && destination.ip().is_unicast_link_local()
+            && destination.scope_id() != 0
+        {
+            let same_scope = matching.find(|route| match route.local {
+                SocketAddr::V6(local) => local.scope_id() == destination.scope_id(),
+                SocketAddr::V4(_) => false,
+            });
+            return Some(same_scope.unwrap_or(first));
+        }
+        Some(first)
+    }
+}
+
 /// A [`UdpSender`] that routes each transmit to the socket with the longest matching range
 struct RoutingSender {
-    /// Routes sorted by prefix length, longest first, each pointing into `senders`
-    routes: Vec<(IpNet, usize)>,
+    routes: Arc<[Route]>,
+    /// One sender per socket, indexed like the endpoint's socket list
     senders: Vec<Pin<Box<dyn UdpSender>>>,
     max_transmit_segments: NonZeroUsize,
 }
 
 impl RoutingSender {
-    fn new(sockets: &[Arc<EndpointSocket>]) -> Self {
-        let mut routes: Vec<_> = sockets
-            .iter()
-            .enumerate()
-            .flat_map(|(i, s)| s.ranges.iter().map(move |r| (*r, i)))
-            .collect();
-        // Stable sort keeps the socket order for equal prefix lengths.
-        routes.sort_by_key(|(range, _)| std::cmp::Reverse(range.prefix_len()));
+    fn new(routes: Arc<[Route]>, sockets: &[Arc<EndpointSocket>]) -> Self {
         let senders: Vec<_> = sockets
             .iter()
             .map(|s| s.socket.lock().unwrap().create_sender())
@@ -1281,18 +1364,14 @@ impl UdpSender for RoutingSender {
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let destination = transmit.destination;
-        let Some(&(range, index)) = this
-            .routes
-            .iter()
-            .find(|(range, _)| route_contains(range, destination.ip()))
-        else {
+        let Some(route) = Route::select(&this.routes, destination, transmit.src_ip) else {
             // Like a failed sendmsg, this counts as loss and is left to QUIC to recover from.
             trace!(%destination, "no socket for destination, dropping transmit");
             return Poll::Ready(Ok(()));
         };
-        let sender = this.senders[index].as_mut();
+        let sender = this.senders[route.socket].as_mut();
         // An IPv4 socket gets a plain IPv4 destination, see `Endpoint::new_with_multiple_sockets`.
-        if let (IpAddr::V4(_), IpAddr::V6(ip)) = (range.addr(), destination.ip())
+        if let (IpAddr::V4(_), IpAddr::V6(ip)) = (route.range.addr(), destination.ip())
             && let Some(ip) = ip.to_ipv4_mapped()
         {
             let transmit = udp::Transmit {
@@ -1309,12 +1388,8 @@ impl UdpSender for RoutingSender {
     }
 
     fn max_transmit_segments_to(&self, destination: SocketAddr) -> NonZeroUsize {
-        match self
-            .routes
-            .iter()
-            .find(|(range, _)| route_contains(range, destination.ip()))
-        {
-            Some(&(_, index)) => self.senders[index].max_transmit_segments_to(destination),
+        match Route::select(&self.routes, destination, None) {
+            Some(route) => self.senders[route.socket].max_transmit_segments_to(destination),
             None => self.max_transmit_segments,
         }
     }
@@ -1335,5 +1410,80 @@ mod tests {
         assert!(route_contains(&v6, "fd15:70a:510b:1::1".parse().unwrap()));
         assert!(!route_contains(&v6, "fd15:70a:510b:2::1".parse().unwrap()));
         assert!(!route_contains(&v6, "10.1.2.3".parse().unwrap()));
+    }
+
+    fn route(range: &str, socket: usize, local: &str) -> Route {
+        Route {
+            range: range.parse().unwrap(),
+            socket,
+            local: local.parse().unwrap(),
+        }
+    }
+
+    fn select(routes: &[Route], dst: &str, src: Option<&str>) -> Option<usize> {
+        Route::select(
+            routes,
+            dst.parse().unwrap(),
+            src.map(|s| s.parse().unwrap()),
+        )
+        .map(|r| r.socket)
+    }
+
+    #[test]
+    fn route_select_by_destination() {
+        let routes = [
+            route("10.1.0.0/16", 1, "10.1.0.5:1"),
+            route("0.0.0.0/0", 0, "0.0.0.0:1"),
+            route("0.0.0.0/0", 2, "192.168.0.7:1"),
+        ];
+        // Longest prefix wins, socket order breaks ties.
+        assert_eq!(select(&routes, "10.1.2.3:443", None), Some(1));
+        assert_eq!(select(&routes, "10.2.2.3:443", None), Some(0));
+        // IPv4-mapped destinations match IPv4 ranges.
+        assert_eq!(select(&routes, "[::ffff:10.1.2.3]:443", None), Some(1));
+        assert_eq!(select(&routes, "[fd00::1]:443", None), None);
+    }
+
+    #[test]
+    fn route_select_by_source() {
+        let routes = [
+            route("10.1.0.0/16", 1, "10.1.0.5:1"),
+            route("0.0.0.0/0", 2, "192.168.0.7:1"),
+            route("0.0.0.0/0", 0, "0.0.0.0:1"),
+        ];
+        // The socket bound to the source wins, wherever it is in prefix order.
+        assert_eq!(
+            select(&routes, "10.1.2.3:443", Some("192.168.0.7")),
+            Some(2)
+        );
+        assert_eq!(select(&routes, "10.1.2.3:443", Some("10.1.0.5")), Some(1));
+        // A wildcard socket takes any source, in prefix order.
+        assert_eq!(select(&routes, "10.2.2.3:443", Some("172.16.0.1")), Some(0));
+        // IPv4-mapped sources match IPv4 sockets.
+        assert_eq!(
+            select(&routes, "10.2.2.3:443", Some("::ffff:192.168.0.7")),
+            Some(2)
+        );
+        // No socket for the source: the catch-all, which is the shortest prefix.
+        let bound_only = &routes[..2];
+        assert_eq!(
+            select(bound_only, "10.1.2.3:443", Some("172.16.0.1")),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn route_select_link_local_scope() {
+        let routes = [
+            route("::/0", 0, "[fe80::1%3]:1"),
+            route("::/0", 1, "[fe80::1%7]:1"),
+        ];
+        assert_eq!(select(&routes, "[fe80::9%7]:443", None), Some(1));
+        assert_eq!(select(&routes, "[fe80::9%3]:443", None), Some(0));
+        // Unknown scope and global destinations use the prefix order.
+        assert_eq!(select(&routes, "[fe80::9%9]:443", None), Some(0));
+        assert_eq!(select(&routes, "[2001:db8::1]:443", None), Some(0));
+        // A source address takes precedence over the scope.
+        assert_eq!(select(&routes, "[fe80::9%7]:443", Some("fe80::1")), Some(0));
     }
 }
