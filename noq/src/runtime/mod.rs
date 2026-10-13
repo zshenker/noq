@@ -10,6 +10,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use udp::{RecvMeta, Transmit};
 
 use crate::Instant;
@@ -64,6 +65,26 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
 
     /// Look up the local IP address and port used by this socket
     fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// The destination IP ranges this socket can send to.
+    ///
+    /// An endpoint with several sockets sends each datagram on the socket with the longest
+    /// matching range. An IPv4 range also matches the IPv4-mapped IPv6 form of its addresses,
+    /// because an endpoint that owns an IPv6 socket represents every remote address as IPv6.
+    ///
+    /// The default covers the whole address family of [`local_addr`], which is what a
+    /// single-socket endpoint always did.
+    ///
+    /// [`local_addr`]: AsyncUdpSocket::local_addr
+    fn ip_ranges(&self) -> Vec<IpNet> {
+        let v4 = IpNet::V4(Ipv4Net::default());
+        let v6 = IpNet::V6(Ipv6Net::default());
+        match self.local_addr() {
+            Ok(addr) if addr.is_ipv4() => vec![v4],
+            Ok(_) => vec![v6],
+            Err(_) => vec![v4, v6],
+        }
+    }
 
     /// Maximum number of datagrams that might be described by a single [`RecvMeta`]
     fn max_receive_segments(&self) -> NonZeroUsize {

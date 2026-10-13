@@ -66,6 +66,7 @@ derive_more = { workspace = true }
 # Enables futures::io::{AsyncRead, AsyncWrite} support for streams
 futures-io = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
+ipnet = { workspace = true }
 pin-project-lite = { workspace = true }
 proto = { package = "noq-proto", path = "../noq-proto", version = "1.3.0", default-features = false }
 rustls = { workspace = true, optional = true }

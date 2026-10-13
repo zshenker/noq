@@ -58,6 +58,7 @@ pub(crate) use std::time::{Duration, Instant};
 #[cfg(wasm_browser)]
 pub(crate) use web_time::{Duration, Instant};
 
+pub use ipnet;
 #[cfg(feature = "bloom")]
 pub use proto::BloomTokenLog;
 pub use proto::{
@@ -108,6 +109,11 @@ enum ConnectionEvent {
     },
     Proto(proto::ConnectionEvent),
     Rebind(Pin<Box<dyn UdpSender>>),
+    /// The endpoint's socket set changed without a rebind, e.g. a failed socket was removed
+    ///
+    /// Only swaps the sender. Paths are left alone: those on the remaining sockets still work,
+    /// those on a removed socket time out like any dead path.
+    ReplaceSender(Pin<Box<dyn UdpSender>>),
     LocalAddressChanged(Option<Arc<dyn NetworkChangeHint + Sync + Send>>),
 }
 

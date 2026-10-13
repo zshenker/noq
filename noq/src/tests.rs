@@ -21,7 +21,7 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use crate::runtime::{AsyncTimer, AsyncUdpSocket, TokioRuntime};
+use crate::runtime::{AsyncTimer, AsyncUdpSocket, Runtime as _, TokioRuntime};
 use crate::{Duration, Instant};
 use bytes::Bytes;
 use proto::{
@@ -346,14 +346,10 @@ impl EndpointFactory {
         let span = info_span!("dummy");
         span.record("otel.name", name.into());
         let _guard = span.entered();
-        let key = PrivateKeyDer::Pkcs8(self.cert.signing_key.serialize_der().into());
         let transport_config = Arc::new(transport_config);
-        let mut server_config =
-            crate::ServerConfig::with_single_cert(vec![self.cert.cert.der().clone()], key).unwrap();
+        let mut server_config = self.server_config();
         server_config.transport_config(transport_config.clone());
 
-        let mut roots = RootCertStore::empty();
-        roots.add(self.cert.cert.der().clone()).unwrap();
         let endpoint = Endpoint::new(
             self.endpoint_config.clone(),
             Some(server_config),
@@ -361,11 +357,38 @@ impl EndpointFactory {
             runtime,
         )
         .unwrap();
-        let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        let mut client_config = self.client_config();
         client_config.transport_config(transport_config);
         endpoint.set_default_client_config(client_config);
 
         endpoint
+    }
+
+    /// A client-only endpoint on `socket`, trusting this factory's certificate
+    fn endpoint_with_socket(&self, name: impl Into<String>, socket: UdpSocket) -> Endpoint {
+        let span = info_span!("dummy");
+        span.record("otel.name", name.into());
+        let _guard = span.entered();
+        let endpoint = Endpoint::new(
+            self.endpoint_config.clone(),
+            None,
+            socket,
+            Arc::new(TokioRuntime),
+        )
+        .unwrap();
+        endpoint.set_default_client_config(self.client_config());
+        endpoint
+    }
+
+    fn server_config(&self) -> crate::ServerConfig {
+        let key = PrivateKeyDer::Pkcs8(self.cert.signing_key.serialize_der().into());
+        crate::ServerConfig::with_single_cert(vec![self.cert.cert.der().clone()], key).unwrap()
+    }
+
+    fn client_config(&self) -> ClientConfig {
+        let mut roots = RootCertStore::empty();
+        roots.add(self.cert.cert.der().clone()).unwrap();
+        ClientConfig::with_root_certificates(Arc::new(roots)).unwrap()
     }
 }
 
@@ -1947,4 +1970,182 @@ impl crate::runtime::Runtime for PanicPropagatingRuntime {
     fn now(&self) -> Instant {
         TokioRuntime.now()
     }
+}
+
+/// An endpoint with an IPv4 and an IPv6 socket serves clients on both.
+///
+/// The IPv6 socket puts the endpoint in IPv6 mode, so the IPv4 socket exercises the address
+/// mapping on receive and the reverse mapping in the routing sender.
+#[tokio::test]
+async fn multiple_sockets() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let v4 = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let v6 = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)).unwrap();
+    let addrs = [v4.local_addr().unwrap(), v6.local_addr().unwrap()];
+    let runtime = TokioRuntime;
+    let server = Endpoint::new_with_multiple_sockets(
+        factory.endpoint_config.clone(),
+        Some(factory.server_config()),
+        vec![
+            runtime.wrap_udp_socket(v4).unwrap(),
+            runtime.wrap_udp_socket(v6).unwrap(),
+        ],
+        Arc::new(runtime),
+    )
+    .unwrap();
+    assert_eq!(server.local_addr().unwrap(), addrs[0]);
+
+    const MSG: &[u8] = b"hello";
+    let accept = tokio::spawn({
+        let server = server.clone();
+        async move {
+            for _ in 0..2 {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                let mut stream = conn.open_uni().await.unwrap();
+                stream.write_all(MSG).await.unwrap();
+                stream.finish().unwrap();
+                _ = stream.stopped().await;
+            }
+        }
+    });
+
+    for addr in addrs {
+        let client = factory.endpoint_with_socket(
+            "client",
+            UdpSocket::bind(SocketAddr::new(addr.ip(), 0)).unwrap(),
+        );
+        let conn = client.connect(addr, "localhost").unwrap().await.unwrap();
+        let mut stream = conn.accept_uni().await.unwrap();
+        assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
+        conn.close(0u32.into(), b"done");
+    }
+    accept.await.unwrap();
+    server.close(0u32.into(), b"done");
+    server.wait_idle().await;
+}
+
+/// A socket wrapper whose `poll_recv` fails once told to.
+#[derive(Debug)]
+struct FailingSocket {
+    inner: Box<dyn AsyncUdpSocket>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AsyncUdpSocket for FailingSocket {
+    fn create_sender(&self) -> Pin<Box<dyn crate::UdpSender>> {
+        self.inner.create_sender()
+    }
+
+    fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Poll::Ready(Err(io::Error::other("test failure")));
+        }
+        self.inner.poll_recv(cx, bufs, meta)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+}
+
+/// Binds a loopback socket, wrapped so the test can make it fail.
+fn failing_socket() -> (Box<dyn AsyncUdpSocket>, Arc<std::sync::atomic::AtomicBool>) {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let socket = FailingSocket {
+        inner: TokioRuntime.wrap_udp_socket(socket).unwrap(),
+        fail: fail.clone(),
+    };
+    (Box::new(socket), fail)
+}
+
+/// A failing socket is removed and the endpoint keeps serving on the other one.
+#[tokio::test]
+async fn failing_socket_is_removed() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let (bad, fail) = failing_socket();
+    let good = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    let good_addr = good.local_addr().unwrap();
+    let server = Endpoint::new_with_multiple_sockets(
+        factory.endpoint_config.clone(),
+        Some(factory.server_config()),
+        vec![bad, TokioRuntime.wrap_udp_socket(good).unwrap()],
+        Arc::new(TokioRuntime),
+    )
+    .unwrap();
+    let bad_addr = server.local_addr().unwrap();
+
+    // Fail the first socket by sending it a datagram, so its receive task runs into the error.
+    fail.store(true, Ordering::SeqCst);
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .unwrap()
+        .send_to(b"x", bad_addr)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.local_addr().unwrap() != good_addr {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed socket was not removed");
+
+    const MSG: &[u8] = b"hello";
+    let accept = tokio::spawn({
+        let server = server.clone();
+        async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let mut stream = conn.open_uni().await.unwrap();
+            stream.write_all(MSG).await.unwrap();
+            stream.finish().unwrap();
+            _ = stream.stopped().await;
+        }
+    });
+    let client = factory.endpoint_with_socket(
+        "client",
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap(),
+    );
+    let conn = client
+        .connect(good_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let mut stream = conn.accept_uni().await.unwrap();
+    assert_eq!(stream.read_to_end(MSG.len()).await.unwrap(), MSG);
+    conn.close(0u32.into(), b"done");
+    accept.await.unwrap();
+}
+
+/// When the last socket fails the endpoint stops, as a single-socket endpoint always did.
+#[tokio::test]
+async fn last_socket_failure_stops_endpoint() {
+    let _guard = subscribe();
+    let factory = EndpointFactory::new();
+    let (bad, fail) = failing_socket();
+    let server = Endpoint::new_with_multiple_sockets(
+        factory.endpoint_config.clone(),
+        Some(factory.server_config()),
+        vec![bad],
+        Arc::new(TokioRuntime),
+    )
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    fail.store(true, Ordering::SeqCst);
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .unwrap()
+        .send_to(b"x", addr)
+        .unwrap();
+    let accepted = tokio::time::timeout(Duration::from_secs(5), server.accept())
+        .await
+        .expect("endpoint did not stop");
+    assert!(
+        accepted.is_none(),
+        "accept should end when the driver stops"
+    );
 }

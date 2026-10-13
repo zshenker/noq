@@ -4,7 +4,7 @@ use std::{
     future::Future,
     io::{self, IoSliceMut},
     mem,
-    net::{SocketAddr, SocketAddrV6},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     num::NonZeroUsize,
     pin::Pin,
     str,
@@ -27,6 +27,7 @@ use crate::{
     udp_transmit,
 };
 use bytes::{Bytes, BytesMut};
+use ipnet::IpNet;
 use pin_project_lite::pin_project;
 use proto::{
     self as proto, ClientConfig, ConnectError, ConnectionError, ConnectionHandle, DatagramEvent,
@@ -50,8 +51,10 @@ use crate::{
 
 /// A QUIC endpoint.
 ///
-/// An endpoint corresponds to a single UDP socket, may host many connections, and may act as both
-/// client and server for different connections.
+/// An endpoint owns one or more UDP sockets, may host many connections, and may act as both
+/// client and server for different connections. With several sockets, each socket is received
+/// from by its own task and outgoing datagrams go to the socket whose
+/// [`ip_ranges`](AsyncUdpSocket::ip_ranges) match the destination.
 ///
 /// May be cloned to obtain another handle to the same endpoint.
 #[derive(Debug, Clone)]
@@ -165,14 +168,44 @@ impl Endpoint {
         socket: Box<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> io::Result<Self> {
-        let addr = socket.local_addr()?;
-        let allow_mtud = !socket.may_fragment();
+        Self::new_with_multiple_sockets(config, server_config, vec![socket], runtime)
+    }
+
+    /// Construct an endpoint with arbitrary configuration and several pre-constructed sockets
+    ///
+    /// Each socket is received from by its own task. Outgoing datagrams go to the socket with the
+    /// longest [`ip_ranges`](AsyncUdpSocket::ip_ranges) entry that contains the destination. If
+    /// several ranges tie, the earlier socket wins. Datagrams that match no socket are dropped.
+    ///
+    /// If any socket is IPv6, the endpoint represents every remote address as IPv6. IPv4 sockets
+    /// then see IPv4-mapped addresses from the endpoint and get plain IPv4 destinations on send.
+    ///
+    /// A socket whose `poll_recv` returns an error is removed from the endpoint and closed.
+    /// Connections keep running over the remaining sockets. When the last socket fails, the
+    /// endpoint stops with that error, as a single-socket endpoint always did. Sockets should
+    /// therefore handle errors they consider transient themselves and only return the ones they
+    /// consider final.
+    pub fn new_with_multiple_sockets(
+        config: EndpointConfig,
+        server_config: Option<ServerConfig>,
+        sockets: Vec<Box<dyn AsyncUdpSocket>>,
+        runtime: Arc<dyn Runtime>,
+    ) -> io::Result<Self> {
+        let sockets = EndpointSocket::new_all(sockets)?;
+        let allow_mtud = sockets
+            .iter()
+            .all(|s| !s.socket.lock().unwrap().may_fragment());
         let rc = EndpointRef::new(
-            socket,
+            sockets,
             proto::Endpoint::new(Arc::new(config), server_config.map(Arc::new), allow_mtud),
-            addr.is_ipv6(),
             runtime.clone(),
         );
+        {
+            let state = rc.state.lock().unwrap();
+            for socket in &state.sockets {
+                SocketDriver::spawn(&rc.0, &state, socket.clone());
+            }
+        }
         let driver = EndpointDriver(rc.clone());
         runtime.spawn(Box::pin(
             async {
@@ -255,7 +288,7 @@ impl Endpoint {
             .inner
             .connect(self.runtime.now(), config, addr, server_name)?;
 
-        let sender = endpoint.socket.create_sender();
+        let sender = endpoint.create_sender();
         endpoint.stats.outgoing_handshakes += 1;
         Ok(endpoint
             .recv_state
@@ -278,19 +311,31 @@ impl Endpoint {
     ///
     /// On error, the old UDP socket is retained.
     pub fn rebind_abstract(&self, socket: Box<dyn AsyncUdpSocket>) -> io::Result<()> {
-        let addr = socket.local_addr()?;
+        self.rebind_multiple_sockets(vec![socket])
+    }
+
+    /// Switch to a new set of UDP sockets
+    ///
+    /// Replaces all current sockets. See [`Endpoint::rebind_abstract()`] and
+    /// [`Endpoint::new_with_multiple_sockets()`] for details.
+    pub fn rebind_multiple_sockets(&self, sockets: Vec<Box<dyn AsyncUdpSocket>>) -> io::Result<()> {
+        let sockets = EndpointSocket::new_all(sockets)?;
         let mut inner = self.inner.state.lock().unwrap();
-        inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
-        inner.ipv6 = addr.is_ipv6();
+        // Only one retired generation is kept, as before with `prev_socket`.
+        for socket in inner.retired.drain(..) {
+            socket.stop();
+        }
+        inner.retired = mem::replace(&mut inner.sockets, sockets);
+        inner.ipv6 = inner.sockets.iter().any(|s| s.ipv6);
+        inner.sender = inner.create_sender();
+        for socket in &inner.sockets {
+            SocketDriver::spawn(&self.inner.0, &inner, socket.clone());
+        }
 
         // Update connection socket references
         for sender in inner.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
-            let _ = sender.send(ConnectionEvent::Rebind(inner.socket.create_sender()));
-        }
-        if let Some(driver) = inner.driver.take() {
-            // Ensure the driver can register for wake-ups from the new socket
-            driver.wake();
+            let _ = sender.send(ConnectionEvent::Rebind(inner.create_sender()));
         }
 
         Ok(())
@@ -334,8 +379,14 @@ impl Endpoint {
     }
 
     /// Get the local `SocketAddr` the underlying socket is bound to
+    ///
+    /// With several sockets, this is the address of the first one.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.state.lock().unwrap().socket.local_addr()
+        self.inner.state.lock().unwrap().sockets[0]
+            .socket
+            .lock()
+            .unwrap()
+            .local_addr()
     }
 
     /// Get the number of connections that are currently open
@@ -459,14 +510,12 @@ impl Future for EndpointDriver {
             endpoint.driver = Some(cx.waker().clone());
         }
 
-        let now = endpoint.runtime.now();
-        let mut keep_going = false;
-        keep_going |= endpoint.drive_recv(cx, now)?;
-        keep_going |= endpoint.handle_events(cx, &self.0.shared);
-
-        if !endpoint.recv_state.incoming.is_empty() {
-            self.0.shared.incoming.notify_waiters();
+        // A receive error on a current socket ends the endpoint, as it did when the driver
+        // received itself.
+        if let Some(e) = endpoint.io_error.take() {
+            return Poll::Ready(Err(e));
         }
+        let keep_going = endpoint.handle_events(cx, &self.0.shared);
 
         // Stop the driver if either:
         // - all `Endpoint` structs are dropped and all connections are drained,
@@ -494,6 +543,9 @@ impl Drop for EndpointDriver {
     fn drop(&mut self) {
         let mut endpoint = self.0.state.lock().unwrap();
         endpoint.driver_lost = true;
+        for socket in endpoint.sockets.iter().chain(&endpoint.retired) {
+            socket.stop();
+        }
         self.0.shared.incoming.notify_waiters();
         // Drop all outgoing channels, signaling the termination of the endpoint to the associated
         // connections.
@@ -526,7 +578,7 @@ impl EndpointInner {
         {
             Ok((handle, conn)) => {
                 state.stats.accepted_handshakes += 1;
-                let sender = state.socket.create_sender();
+                let sender = state.create_sender();
                 let runtime = state.runtime.clone();
                 Ok(state
                     .recv_state
@@ -567,11 +619,15 @@ impl EndpointInner {
 
 #[derive(Debug)]
 pub(crate) struct State {
-    socket: Box<dyn AsyncUdpSocket>,
+    /// The current sockets, each received from by its own [`SocketDriver`]
+    sockets: Vec<Arc<EndpointSocket>>,
+    /// Sender for endpoint-generated responses, routing to all current sockets
     sender: Pin<Box<dyn UdpSender>>,
-    /// During an active migration, abandoned_socket receives traffic
-    /// until the first packet arrives on the new socket.
-    prev_socket: Option<Box<dyn AsyncUdpSocket>>,
+    /// During an active migration, the retired sockets receive traffic
+    /// until the first packet arrives on a new socket.
+    retired: Vec<Arc<EndpointSocket>>,
+    /// A fatal receive error reported by a [`SocketDriver`], picked up by the endpoint driver
+    io_error: Option<io::Error>,
     inner: proto::Endpoint,
     recv_state: RecvState,
     driver: Option<Waker>,
@@ -602,39 +658,82 @@ pub(crate) struct Shared {
 }
 
 impl State {
-    fn drive_recv(&mut self, cx: &mut Context<'_>, now: Instant) -> Result<bool, io::Error> {
-        let get_time = || self.runtime.now();
-        self.recv_state.recv_limiter.start_cycle(get_time);
-        if let Some(socket) = &mut self.prev_socket {
-            // We don't care about the `PollProgress` from old sockets.
-            let poll_res = self.recv_state.poll_socket(
-                cx,
-                &mut self.inner,
-                &mut **socket,
-                &mut self.sender,
-                &*self.runtime,
-                now,
-            );
-            if poll_res.is_err() {
-                self.prev_socket = None;
-            }
-        };
-        let poll_res = self.recv_state.poll_socket(
-            cx,
-            &mut self.inner,
-            &mut *self.socket,
-            &mut self.sender,
-            &*self.runtime,
-            now,
-        );
-        self.recv_state.recv_limiter.finish_cycle(get_time);
-        let poll_res = poll_res?;
-        if poll_res.received_connection_packet {
-            // Traffic has arrived on self.socket, therefore there is no need for the abandoned
-            // one anymore. TODO: Account for multiple outgoing connections.
-            self.prev_socket = None;
+    /// Creates a sender that routes transmits to the current sockets
+    fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
+        if let [socket] = &self.sockets[..] {
+            // Keep the single-socket path free of routing.
+            return socket.socket.lock().unwrap().create_sender();
         }
-        Ok(poll_res.keep_going)
+        Box::pin(RoutingSender::new(&self.sockets))
+    }
+
+    /// Returns whether `socket` is one of the current sockets, as opposed to a retired one
+    fn is_current(&self, socket: &Arc<EndpointSocket>) -> bool {
+        self.sockets.iter().any(|s| Arc::ptr_eq(s, socket))
+    }
+
+    /// Dispatches a batch of datagrams received on `socket`
+    fn handle_datagrams(
+        &mut self,
+        socket: &Arc<EndpointSocket>,
+        metas: &[RecvMeta],
+        bufs: &[IoSliceMut<'_>],
+        now: Instant,
+    ) {
+        let mut received_connection_packet = false;
+        for (meta, buf) in metas.iter().zip(bufs) {
+            let mut data: BytesMut = buf[0..meta.len].into();
+            // Mirror the sender, which hands IPv4 sockets plain IPv4 destinations.
+            let addr = if self.ipv6 {
+                SocketAddr::V6(ensure_ipv6(meta.addr))
+            } else {
+                meta.addr
+            };
+            while !data.is_empty() {
+                let buf = data.split_to(meta.stride.min(data.len()));
+                let mut response_buffer = Vec::new();
+                let addresses = FourTuple::new(addr, meta.dst_ip);
+                match self.inner.handle(
+                    now,
+                    addresses,
+                    meta.ecn.map(proto_ecn),
+                    buf,
+                    &mut response_buffer,
+                ) {
+                    Some(DatagramEvent::NewConnection(incoming)) => {
+                        if self.recv_state.connections.close.is_none() {
+                            self.recv_state.incoming.push_back(incoming);
+                        } else {
+                            let transmit = self.inner.refuse(incoming, &mut response_buffer);
+                            respond(transmit, &response_buffer, &mut self.sender);
+                        }
+                    }
+                    Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                        // Ignoring errors from dropped connections that haven't yet
+                        // been cleaned up
+                        received_connection_packet = true;
+                        let _ = self
+                            .recv_state
+                            .connections
+                            .senders
+                            .get_mut(&handle)
+                            .unwrap()
+                            .send(ConnectionEvent::Proto(event));
+                    }
+                    Some(DatagramEvent::Response(transmit)) => {
+                        respond(transmit, &response_buffer, &mut self.sender);
+                    }
+                    None => {}
+                }
+            }
+        }
+        if received_connection_packet && !self.retired.is_empty() && self.is_current(socket) {
+            // Traffic has arrived on a current socket, therefore there is no need for the
+            // retired ones anymore. TODO: Account for multiple outgoing connections.
+            for socket in self.retired.drain(..) {
+                socket.stop();
+            }
+        }
     }
 
     fn handle_events(&mut self, cx: &mut Context<'_>, shared: &Shared) -> bool {
@@ -839,14 +938,30 @@ pub(crate) struct EndpointRef(Arc<EndpointInner>);
 
 impl EndpointRef {
     pub(crate) fn new(
-        socket: Box<dyn AsyncUdpSocket>,
+        sockets: Vec<Arc<EndpointSocket>>,
         inner: proto::Endpoint,
-        ipv6: bool,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
-        let recv_state = RecvState::new(sender, socket.max_receive_segments(), &inner);
-        let sender = socket.create_sender();
+        let recv_state = RecvState::new(sender);
+        let mut state = State {
+            sockets,
+            // Replaced below, once `State::create_sender` can see the sockets.
+            sender: Box::pin(RoutingSender::new(&[])),
+            retired: Vec::new(),
+            io_error: None,
+            inner,
+            ipv6: false,
+            events,
+            driver: None,
+            driver_lost: false,
+            recv_state,
+            runtime,
+            stats: EndpointStats::default(),
+            default_client_config: None,
+        };
+        state.ipv6 = state.sockets.iter().any(|s| s.ipv6);
+        state.sender = state.create_sender();
         Self(Arc::new(EndpointInner {
             shared: Shared {
                 incoming: Notify::new(),
@@ -854,20 +969,7 @@ impl EndpointRef {
                 idle: Notify::new(),
                 ref_count: AtomicUsize::new(0),
             },
-            state: Mutex::new(State {
-                socket,
-                sender,
-                prev_socket: None,
-                inner,
-                ipv6,
-                events,
-                driver: None,
-                driver_lost: false,
-                recv_state,
-                runtime,
-                stats: EndpointStats::default(),
-                default_client_config: None,
-            }),
+            state: Mutex::new(state),
         }))
     }
 }
@@ -902,25 +1004,14 @@ impl std::ops::Deref for EndpointRef {
 }
 
 /// State directly involved in handling incoming packets
+#[derive(Debug)]
 struct RecvState {
     incoming: VecDeque<proto::Incoming>,
     connections: ConnectionSet,
-    recv_buf: Box<[u8]>,
-    recv_limiter: WorkLimiter,
 }
 
 impl RecvState {
-    fn new(
-        sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>,
-        max_receive_segments: NonZeroUsize,
-        endpoint: &proto::Endpoint,
-    ) -> Self {
-        let recv_buf = vec![
-            0;
-            endpoint.config().get_max_udp_payload_size().min(64 * 1024) as usize
-                * max_receive_segments.get()
-                * BATCH_SIZE
-        ];
+    fn new(sender: mpsc::UnboundedSender<(ConnectionHandle, EndpointEvent)>) -> Self {
         Self {
             connections: ConnectionSet {
                 senders: FxHashMap::default(),
@@ -929,26 +1020,140 @@ impl RecvState {
                 active_connections: 0,
             },
             incoming: VecDeque::new(),
-            recv_buf: recv_buf.into(),
-            recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
         }
     }
+}
 
-    fn poll_socket(
-        &mut self,
-        cx: &mut Context<'_>,
-        endpoint: &mut proto::Endpoint,
-        socket: &mut dyn AsyncUdpSocket,
-        sender: &mut Pin<Box<dyn UdpSender>>,
-        runtime: &dyn Runtime,
-        now: Instant,
-    ) -> Result<PollProgress, io::Error> {
-        let mut received_connection_packet = false;
+/// A socket of the endpoint, shared between [`State`] and the socket's [`SocketDriver`]
+#[derive(Debug)]
+pub(crate) struct EndpointSocket {
+    /// Locked by the driver for `poll_recv` and by the state to create senders
+    socket: Mutex<Box<dyn AsyncUdpSocket>>,
+    /// Destination ranges this socket sends to, see [`AsyncUdpSocket::ip_ranges`]
+    ranges: Vec<IpNet>,
+    /// Whether the socket's local address is IPv6
+    ipv6: bool,
+    max_receive_segments: NonZeroUsize,
+    /// Stop signal for the socket's [`SocketDriver`]
+    recv: Mutex<RecvTask>,
+}
+
+/// The waker and stop flag of a [`SocketDriver`]
+#[derive(Debug, Default)]
+struct RecvTask {
+    waker: Option<Waker>,
+    stopped: bool,
+}
+
+impl EndpointSocket {
+    fn new_all(sockets: Vec<Box<dyn AsyncUdpSocket>>) -> io::Result<Vec<Arc<Self>>> {
+        if sockets.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "an endpoint needs at least one socket",
+            ));
+        }
+        sockets
+            .into_iter()
+            .map(|socket| {
+                Ok(Arc::new(Self {
+                    ipv6: socket.local_addr()?.is_ipv6(),
+                    ranges: socket.ip_ranges(),
+                    max_receive_segments: socket.max_receive_segments(),
+                    socket: Mutex::new(socket),
+                    recv: Mutex::new(RecvTask::default()),
+                }))
+            })
+            .collect()
+    }
+
+    /// Tells the socket's [`SocketDriver`] to exit
+    fn stop(&self) {
+        let mut recv = self.recv.lock().unwrap();
+        recv.stopped = true;
+        if let Some(waker) = recv.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+/// A future that receives datagrams from one socket and feeds them to the endpoint
+///
+/// One of these runs per socket, so a socket that is not ready is simply not polled, and sockets
+/// are received from in parallel on a multi-threaded runtime. The socket is polled without the
+/// endpoint [`State`] lock. The lock is taken only to dispatch a received batch.
+///
+/// The driver exits when its socket is stopped, see [`EndpointSocket::stop`].
+struct SocketDriver {
+    endpoint: Arc<EndpointInner>,
+    socket: Arc<EndpointSocket>,
+    runtime: Arc<dyn Runtime>,
+    recv_buf: Box<[u8]>,
+    recv_limiter: WorkLimiter,
+}
+
+impl SocketDriver {
+    fn spawn(endpoint: &Arc<EndpointInner>, state: &State, socket: Arc<EndpointSocket>) {
+        let recv_buf = vec![
+            0;
+            state
+                .inner
+                .config()
+                .get_max_udp_payload_size()
+                .min(64 * 1024) as usize
+                * socket.max_receive_segments.get()
+                * BATCH_SIZE
+        ];
+        let driver = Self {
+            endpoint: endpoint.clone(),
+            socket,
+            runtime: state.runtime.clone(),
+            recv_buf: recv_buf.into(),
+            recv_limiter: WorkLimiter::new(RECV_TIME_BOUND),
+        };
+        state
+            .runtime
+            .spawn(Box::pin(driver.instrument(Span::current())));
+    }
+
+    /// Reports a receive error
+    ///
+    /// Removes the socket from the endpoint. If it was the last one, the endpoint ends with the
+    /// error instead. A socket that was already retired by a rebind is simply dropped.
+    fn fail(&self, e: io::Error) {
+        let mut state = self.endpoint.state.lock().unwrap();
+        if !state.is_current(&self.socket) {
+            return;
+        }
+        if state.sockets.len() == 1 {
+            state.io_error = Some(e);
+            if let Some(driver) = state.driver.take() {
+                driver.wake();
+            }
+            return;
+        }
+        tracing::warn!(error = %e, "socket failed to receive, removing it from the endpoint");
+        state.sockets.retain(|s| !Arc::ptr_eq(s, &self.socket));
+        state.sender = state.create_sender();
+        for sender in state.recv_state.connections.senders.values() {
+            // Ignoring errors from dropped connections
+            let _ = sender.send(ConnectionEvent::ReplaceSender(state.create_sender()));
+        }
+    }
+}
+
+impl Future for SocketDriver {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = &mut *self;
+        let get_time = || this.runtime.now();
+        this.recv_limiter.start_cycle(get_time);
         let mut metas = [RecvMeta::default(); BATCH_SIZE];
         let mut iovs: [IoSliceMut<'_>; BATCH_SIZE] = {
-            let mut bufs = self
+            let mut bufs = this
                 .recv_buf
-                .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
+                .chunks_mut(this.recv_buf.len() / BATCH_SIZE)
                 .map(IoSliceMut::new);
 
             // expect() safe as self.recv_buf is chunked into BATCH_SIZE items
@@ -956,56 +1161,40 @@ impl RecvState {
             // exactly BATCH_SIZE times.
             std::array::from_fn(|_| bufs.next().expect("BATCH_SIZE elements"))
         };
-        loop {
-            match socket.poll_recv(cx, &mut iovs, &mut metas) {
+        let result = loop {
+            if this.socket.recv.lock().unwrap().stopped {
+                break Poll::Ready(());
+            }
+            let poll = this
+                .socket
+                .socket
+                .lock()
+                .unwrap()
+                .poll_recv(cx, &mut iovs, &mut metas);
+            match poll {
                 Poll::Ready(Ok(msgs)) => {
-                    self.recv_limiter.record_work(msgs);
-                    for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
-                        let mut data: BytesMut = buf[0..meta.len].into();
-                        while !data.is_empty() {
-                            let buf = data.split_to(meta.stride.min(data.len()));
-                            let mut response_buffer = Vec::new();
-                            let addresses = FourTuple::new(meta.addr, meta.dst_ip);
-                            match endpoint.handle(
-                                now,
-                                addresses,
-                                meta.ecn.map(proto_ecn),
-                                buf,
-                                &mut response_buffer,
-                            ) {
-                                Some(DatagramEvent::NewConnection(incoming)) => {
-                                    if self.connections.close.is_none() {
-                                        self.incoming.push_back(incoming);
-                                    } else {
-                                        let transmit =
-                                            endpoint.refuse(incoming, &mut response_buffer);
-                                        respond(transmit, &response_buffer, sender);
-                                    }
-                                }
-                                Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                                    // Ignoring errors from dropped connections that haven't yet
-                                    // been cleaned up
-                                    received_connection_packet = true;
-                                    let _ = self
-                                        .connections
-                                        .senders
-                                        .get_mut(&handle)
-                                        .unwrap()
-                                        .send(ConnectionEvent::Proto(event));
-                                }
-                                Some(DatagramEvent::Response(transmit)) => {
-                                    respond(transmit, &response_buffer, sender);
-                                }
-                                None => {}
-                            }
-                        }
+                    this.recv_limiter.record_work(msgs);
+                    let now = this.runtime.now();
+                    let mut state = this.endpoint.state.lock().unwrap();
+                    if state.driver_lost {
+                        // The endpoint driver stopped between our stop check and here, and
+                        // the connection senders are gone.
+                        break Poll::Ready(());
+                    }
+                    state.handle_datagrams(&this.socket, &metas[..msgs], &iovs[..msgs], now);
+                    let has_incoming = !state.recv_state.incoming.is_empty();
+                    drop(state);
+                    if has_incoming {
+                        this.endpoint.shared.incoming.notify_waiters();
                     }
                 }
                 Poll::Pending => {
-                    return Ok(PollProgress {
-                        received_connection_packet,
-                        keep_going: false,
-                    });
+                    let mut recv = this.socket.recv.lock().unwrap();
+                    if recv.stopped {
+                        break Poll::Ready(());
+                    }
+                    recv.waker = Some(cx.waker().clone());
+                    break Poll::Pending;
                 }
                 // Ignore ECONNRESET as it's undefined in QUIC and may be injected by an
                 // attacker
@@ -1013,34 +1202,123 @@ impl RecvState {
                     continue;
                 }
                 Poll::Ready(Err(e)) => {
-                    return Err(e);
+                    this.fail(e);
+                    break Poll::Ready(());
                 }
             }
-            if !self.recv_limiter.allow_work(|| runtime.now()) {
-                return Ok(PollProgress {
-                    received_connection_packet,
-                    keep_going: true,
-                });
+            if !this.recv_limiter.allow_work(get_time) {
+                // Yield for fairness and continue in the next poll.
+                cx.waker().wake_by_ref();
+                break Poll::Pending;
             }
+        };
+        this.recv_limiter.finish_cycle(get_time);
+        result
+    }
+}
+
+/// Returns whether `ip` is in `range`, treating IPv4-mapped addresses as IPv4
+fn route_contains(range: &IpNet, ip: IpAddr) -> bool {
+    match (range, ip) {
+        (IpNet::V4(range), IpAddr::V6(ip)) => {
+            ip.to_ipv4_mapped().is_some_and(|ip| range.contains(&ip))
+        }
+        (range, ip) => range.contains(&ip),
+    }
+}
+
+/// A [`UdpSender`] that routes each transmit to the socket with the longest matching range
+struct RoutingSender {
+    /// Routes sorted by prefix length, longest first, each pointing into `senders`
+    routes: Vec<(IpNet, usize)>,
+    senders: Vec<Pin<Box<dyn UdpSender>>>,
+    max_transmit_segments: NonZeroUsize,
+}
+
+impl RoutingSender {
+    fn new(sockets: &[Arc<EndpointSocket>]) -> Self {
+        let mut routes: Vec<_> = sockets
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| s.ranges.iter().map(move |r| (*r, i)))
+            .collect();
+        // Stable sort keeps the socket order for equal prefix lengths.
+        routes.sort_by_key(|(range, _)| std::cmp::Reverse(range.prefix_len()));
+        let senders: Vec<_> = sockets
+            .iter()
+            .map(|s| s.socket.lock().unwrap().create_sender())
+            .collect();
+        let max_transmit_segments = senders
+            .iter()
+            .map(|s| s.max_transmit_segments())
+            .min()
+            .unwrap_or(NonZeroUsize::MIN);
+        Self {
+            routes,
+            senders,
+            max_transmit_segments,
         }
     }
 }
 
-impl fmt::Debug for RecvState {
+impl fmt::Debug for RoutingSender {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RecvState")
-            .field("incoming", &self.incoming)
-            .field("connections", &self.connections)
-            // recv_buf too large
-            .field("recv_limiter", &self.recv_limiter)
+        f.debug_struct("RoutingSender")
+            .field("routes", &self.routes)
             .finish_non_exhaustive()
     }
 }
 
-#[derive(Default)]
-struct PollProgress {
-    /// Whether a datagram was routed to an existing connection
-    received_connection_packet: bool,
-    /// Whether datagram handling was interrupted early by the work limiter for fairness
-    keep_going: bool,
+impl UdpSender for RoutingSender {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        transmit: &udp::Transmit<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let destination = transmit.destination;
+        let Some(&(range, index)) = this
+            .routes
+            .iter()
+            .find(|(range, _)| route_contains(range, destination.ip()))
+        else {
+            // Like a failed sendmsg, this counts as loss and is left to QUIC to recover from.
+            trace!(%destination, "no socket for destination, dropping transmit");
+            return Poll::Ready(Ok(()));
+        };
+        let sender = this.senders[index].as_mut();
+        // An IPv4 socket gets a plain IPv4 destination, see `Endpoint::new_with_multiple_sockets`.
+        if let (IpAddr::V4(_), IpAddr::V6(ip)) = (range.addr(), destination.ip())
+            && let Some(ip) = ip.to_ipv4_mapped()
+        {
+            let transmit = udp::Transmit {
+                destination: SocketAddr::new(ip.into(), destination.port()),
+                ..transmit.clone()
+            };
+            return sender.poll_send(&transmit, cx);
+        }
+        sender.poll_send(transmit, cx)
+    }
+
+    fn max_transmit_segments(&self) -> NonZeroUsize {
+        self.max_transmit_segments
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_contains_maps_ipv4() {
+        let v4: IpNet = "10.0.0.0/8".parse().unwrap();
+        let v6: IpNet = "fd15:70a:510b:1::/64".parse().unwrap();
+        assert!(route_contains(&v4, "10.1.2.3".parse().unwrap()));
+        assert!(route_contains(&v4, "::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!route_contains(&v4, "11.1.2.3".parse().unwrap()));
+        assert!(!route_contains(&v4, "fd15:70a:510b:1::1".parse().unwrap()));
+        assert!(route_contains(&v6, "fd15:70a:510b:1::1".parse().unwrap()));
+        assert!(!route_contains(&v6, "fd15:70a:510b:2::1".parse().unwrap()));
+        assert!(!route_contains(&v6, "10.1.2.3".parse().unwrap()));
+    }
 }
