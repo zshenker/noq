@@ -325,8 +325,8 @@ impl Endpoint {
         for socket in inner.retired.drain(..) {
             socket.stop();
         }
-        let retired = mem::take(&mut inner.sockets);
-        inner.retired = retired;
+        inner.retired = mem::take(&mut inner.sockets);
+        inner.ipv6 = sockets.iter().any(|s| s.local_addr.is_ipv6());
         inner.set_sockets(sockets);
         for socket in &inner.sockets {
             SocketDriver::spawn(&self.inner.0, &inner, socket.clone());
@@ -671,21 +671,16 @@ pub(crate) struct Shared {
 }
 
 impl State {
-    /// Replaces the current sockets and everything derived from them
+    /// Replaces the current sockets and the route table and sender derived from them
     fn set_sockets(&mut self, sockets: Vec<Arc<EndpointSocket>>) {
         self.sockets = sockets;
-        self.ipv6 = self.sockets.iter().any(|s| s.ipv6);
         self.routes = Route::table(&self.sockets);
         self.sender = self.create_sender();
     }
 
     /// Creates a sender that routes transmits to the current sockets
     fn create_sender(&self) -> Pin<Box<dyn UdpSender>> {
-        if let [socket] = &self.sockets[..] {
-            // Keep the single-socket path free of routing.
-            return socket.socket.lock().unwrap().create_sender();
-        }
-        Box::pin(RoutingSender::new(self.routes.clone(), &self.sockets))
+        RoutingSender::create(&self.routes, &self.sockets)
     }
 
     /// Returns whether `socket` is one of the current sockets, as opposed to a retired one
@@ -965,15 +960,15 @@ impl EndpointRef {
     ) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
         let recv_state = RecvState::new(sender);
-        let mut state = State {
-            sockets: Vec::new(),
-            routes: Arc::from([]),
-            // Replaced by `set_sockets` below.
-            sender: Box::pin(RoutingSender::new(Arc::from([]), &[])),
+        let routes = Route::table(&sockets);
+        let state = State {
+            sender: RoutingSender::create(&routes, &sockets),
+            ipv6: sockets.iter().any(|s| s.local_addr.is_ipv6()),
+            sockets,
+            routes,
             retired: Vec::new(),
             io_error: None,
             inner,
-            ipv6: false,
             events,
             driver: None,
             driver_lost: false,
@@ -982,7 +977,6 @@ impl EndpointRef {
             stats: EndpointStats::default(),
             default_client_config: None,
         };
-        state.set_sockets(sockets);
         Self(Arc::new(EndpointInner {
             shared: Shared {
                 incoming: Notify::new(),
@@ -1060,9 +1054,6 @@ pub(crate) struct EndpointSocket {
     ranges: Vec<IpNet>,
     /// The socket's local address, see [`Route::local`]
     local_addr: SocketAddr,
-    /// Whether the socket's local address is IPv6
-    ipv6: bool,
-    max_receive_segments: NonZeroUsize,
     /// Set to tell the socket's [`SocketDriver`] to exit
     stopped: AtomicBool,
     /// The waker of the parked [`SocketDriver`], to wake it when stopped
@@ -1082,12 +1073,9 @@ impl EndpointSocket {
         sockets
             .into_iter()
             .map(|socket| {
-                let local_addr = socket.local_addr()?;
                 Ok(Arc::new(Self {
-                    local_addr,
-                    ipv6: local_addr.is_ipv6(),
+                    local_addr: socket.local_addr()?,
                     ranges: socket.ip_ranges(),
-                    max_receive_segments: socket.max_receive_segments(),
                     socket: Mutex::new(socket),
                     stopped: AtomicBool::new(false),
                     recv_waker: Mutex::new(None),
@@ -1131,7 +1119,7 @@ impl SocketDriver {
                 .config()
                 .get_max_udp_payload_size()
                 .min(64 * 1024) as usize
-                * socket.max_receive_segments.get()
+                * socket.socket.lock().unwrap().max_receive_segments().get()
                 * BATCH_SIZE
         ];
         let driver = Self {
@@ -1165,10 +1153,8 @@ impl SocketDriver {
         tracing::warn!(error = %e, "socket failed to receive, removing it from the endpoint");
         let mut sockets = mem::take(&mut state.sockets);
         sockets.retain(|s| !Arc::ptr_eq(s, &self.socket));
-        // Keep `ipv6` as it is: addresses already in use stay in their representation.
-        let ipv6 = state.ipv6;
+        // `ipv6` stays as it is: addresses already in use keep their representation.
         state.set_sockets(sockets);
-        state.ipv6 = ipv6;
         for sender in state.recv_state.connections.senders.values() {
             // Ignoring errors from dropped connections
             let _ = sender.send(ConnectionEvent::ReplaceSender(state.create_sender()));
@@ -1348,7 +1334,12 @@ struct RoutingSender {
 }
 
 impl RoutingSender {
-    fn new(routes: Arc<[Route]>, sockets: &[Arc<EndpointSocket>]) -> Self {
+    /// Creates the sender for `sockets`, or the socket's own sender if there is only one
+    fn create(routes: &Arc<[Route]>, sockets: &[Arc<EndpointSocket>]) -> Pin<Box<dyn UdpSender>> {
+        if let [socket] = sockets {
+            // Keep the single-socket path free of routing.
+            return socket.socket.lock().unwrap().create_sender();
+        }
         let senders: Vec<_> = sockets
             .iter()
             .map(|s| s.socket.lock().unwrap().create_sender())
@@ -1358,11 +1349,11 @@ impl RoutingSender {
             .map(|s| s.max_transmit_segments())
             .min()
             .unwrap_or(NonZeroUsize::MIN);
-        Self {
-            routes,
+        Box::pin(Self {
+            routes: routes.clone(),
             senders,
             max_transmit_segments,
-        }
+        })
     }
 }
 
